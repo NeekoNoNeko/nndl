@@ -1,218 +1,223 @@
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader
-from torch.nn.utils.rnn import pad_sequence, pack_padded_sequence
-import glob
 import os
-import unicodedata
-import string
-import time
-import random
+import torch
 import numpy as np
-import matplotlib.pyplot as plt
+import traceback as tb
+os.environ["PYTHONUTF8"] = "1"
 
-# ======================
-# 设备
-# ======================
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print(f"Using device: {device}")
+## Basic Usage
 
-# ======================
-# 字符处理
-# ======================
-allowed_characters = string.ascii_letters + " .,;'" + "_"
-n_letters = len(allowed_characters)
+torch._logging.set_logs(graph_code=True)
 
-def unicodeToAscii(s):
-    return ''.join(
-        c for c in unicodedata.normalize('NFD', s)
-        if unicodedata.category(c) != 'Mn'
-        and c in allowed_characters
-    )
+def foo(x, y):
+    a = torch.sin(x)
+    b = torch.cos(y)
+    return a + b
 
-def letterToIndex(letter):
-    return allowed_characters.find(letter) if letter in allowed_characters else allowed_characters.find("_")
 
-def lineToTensor(line):
-    return torch.tensor([letterToIndex(c) for c in line], dtype=torch.long)
+opt_foo1 = torch.compile(foo, backend="aot_eager")
+print(opt_foo1(torch.randn(3, 3), torch.randn(3, 3)))
 
-# ======================
-# Dataset
-# ======================
-class NamesDataset(Dataset):
-    def __init__(self, data_dir):
-        self.data = []
-        self.labels = []
-        labels_set = set()
 
-        files = glob.glob(os.path.join(data_dir, "*.txt"))
-        for filename in files:
-            label = os.path.splitext(os.path.basename(filename))[0]
-            labels_set.add(label)
+@torch.compile(backend="aot_eager")
+def opt_foo2(x, y):
+    a = torch.sin(x)
+    b = torch.cos(y)
+    return a + b
 
-            lines = open(filename, encoding="utf-8").read().strip().split("\n")
-            for name in lines:
-                name = unicodeToAscii(name)
-                if len(name) == 0:
-                    continue
-                self.data.append(lineToTensor(name))
-                self.labels.append(label)
 
-        self.labels_uniq = list(labels_set)
-        self.label_map = {l: i for i, l in enumerate(self.labels_uniq)}
+print(opt_foo2(torch.randn(3, 3), torch.randn(3, 3)))
 
-        self.label_tensors = [
-            torch.tensor(self.label_map[l], dtype=torch.long)
-            for l in self.labels
-        ]
 
-    def __len__(self):
-        return len(self.data)
+def inner(x):
+    return torch.sin(x)
 
-    def __getitem__(self, idx):
-        return self.label_tensors[idx], self.data[idx]
 
-# ======================
-# collate_fn（关键）
-# ======================
-def collate_fn(batch):
-    labels, texts = zip(*batch)
+@torch.compile
+def outer(x, y):
+    a = inner(x)
+    b = torch.cos(y)
+    return a + b
 
-    labels = torch.stack(labels)
-    lengths = torch.tensor([len(t) for t in texts])
 
-    texts_padded = pad_sequence(texts, batch_first=True)
+print(outer(torch.randn(3, 3), torch.randn(3, 3)))
 
-    return labels, texts_padded, lengths
 
-# ======================
-# 模型（GRU + Embedding）
-# ======================
-class CharRNN(nn.Module):
-    def __init__(self, vocab_size, hidden_size, output_size):
+t = torch.randn(10, 100)
+
+
+class MyModule(torch.nn.Module):
+    def __init__(self):
         super().__init__()
+        self.lin = torch.nn.Linear(3, 3)
 
-        self.embedding = nn.Embedding(vocab_size, hidden_size)
-        self.rnn = nn.GRU(hidden_size, hidden_size, batch_first=True)
-        self.fc = nn.Linear(hidden_size, output_size)
+    def forward(self, x):
+        return torch.nn.functional.relu(self.lin(x))
 
-    def forward(self, x, lengths):
-        x = self.embedding(x)
 
-        packed = pack_padded_sequence(
-            x,
-            lengths.cpu(),
-            batch_first=True,
-            enforce_sorted=False
-        )
+mod1 = MyModule()
+mod1.compile()
+print(mod1(torch.randn(3, 3)))
 
-        _, hidden = self.rnn(packed)
-        out = self.fc(hidden.squeeze(0))
+mod2 = MyModule()
+mod2 = torch.compile(mod2)
+print(mod2(torch.randn(3, 3)))
 
-        return F.log_softmax(out, dim=1)
 
-# ======================
-# 训练函数
-# ======================
-def train_model(model, train_loader, epochs=20, lr=0.003):
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-    criterion = nn.NLLLoss()
 
-    scaler = torch.cuda.amp.GradScaler() if torch.cuda.is_available() else None
-    use_amp = torch.cuda.is_available()
+## Demonstrating Speedups
 
-    losses = []
+def foo3(x):
+    y = x + 1
+    z = torch.nn.functional.relu(y)
+    u = z * 2
+    return u
 
-    for epoch in range(epochs):
-        model.train()
-        total_loss = 0
 
-        for labels, texts, lengths in train_loader:
-            labels = labels.to(device)
-            texts = texts.to(device)
+opt_foo3 = torch.compile(foo3)
 
-            optimizer.zero_grad()
 
-            if use_amp:
-                with torch.cuda.amp.autocast():
-                    outputs = model(texts, lengths)
-                    loss = criterion(outputs, labels)
-                scaler.scale(loss).backward()
-                scaler.step(optimizer)
-                scaler.update()
-            else:
-                outputs = model(texts, lengths)
-                loss = criterion(outputs, labels)
-                loss.backward()
-                optimizer.step()
+# Returns the result of running `fn()` and the time it took for `fn()` to run,
+# in seconds. We use CUDA events and synchronization for the most accurate
+# measurements.
+def timed(fn):
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    start.record()
+    result = fn()
+    end.record()
+    torch.cuda.synchronize()
+    return result, start.elapsed_time(end) / 1000
 
-            total_loss += loss.item()
 
-        avg_loss = total_loss / len(train_loader)
-        losses.append(avg_loss)
+inp = torch.randn(4096, 4096).cuda()
+print("compile:", timed(lambda: opt_foo3(inp))[1])
+print("eager:", timed(lambda: foo3(inp))[1])
 
-        print(f"Epoch {epoch+1}: loss={avg_loss:.4f}")
+# turn off logging for now to prevent spam
+torch._logging.set_logs(graph_code=False)
 
-    return losses
+eager_times = []
+for i in range(10):
+    _, eager_time = timed(lambda: foo3(inp))
+    eager_times.append(eager_time)
+    print(f"eager time {i}: {eager_time}")
+print("~" * 10)
 
-# ======================
-# 评估
-# ======================
-def evaluate(model, loader, classes):
-    confusion = torch.zeros(len(classes), len(classes))
+compile_times = []
+for i in range(10):
+    _, compile_time = timed(lambda: opt_foo3(inp))
+    compile_times.append(compile_time)
+    print(f"compile time {i}: {compile_time}")
+print("~" * 10)
 
-    model.eval()
-    with torch.no_grad():
-        for labels, texts, lengths in loader:
-            texts = texts.to(device)
-            outputs = model(texts, lengths)
-            preds = torch.argmax(outputs, dim=1).cpu()
 
-            for i in range(len(labels)):
-                confusion[labels[i]][preds[i]] += 1
 
-    for i in range(len(classes)):
-        if confusion[i].sum() > 0:
-            confusion[i] /= confusion[i].sum()
+eager_med = np.median(eager_times)
+compile_med = np.median(compile_times)
+speedup = eager_med / compile_med
+assert speedup > 1
+print(
+    f"(eval) eager median: {eager_med}, compile median: {compile_med}, speedup: {speedup}x"
+)
+print("~" * 10)
 
-    plt.imshow(confusion.numpy())
-    plt.colorbar()
-    plt.title("Confusion Matrix")
-    plt.show()
 
-# ======================
-# 主流程
-# ======================
-if __name__ == "__main__":
 
-    dataset = NamesDataset("data/names")
-    print(f"Total samples: {len(dataset)}")
+## Benefits over TorchScript
 
-    train_size = int(0.85 * len(dataset))
-    test_size = len(dataset) - train_size
+def f1(x, y):
+    if x.sum() < 0:
+        return -y
+    return y
 
-    train_set, test_set = torch.utils.data.random_split(dataset, [train_size, test_size])
 
-    train_loader = DataLoader(train_set, batch_size=64, shuffle=True, collate_fn=collate_fn)
-    test_loader = DataLoader(test_set, batch_size=64, shuffle=False, collate_fn=collate_fn)
+# Test that `fn1` and `fn2` return the same result, given the same arguments `args`.
+def test_fns(fn1, fn2, args):
+    out1 = fn1(*args)
+    out2 = fn2(*args)
+    return torch.allclose(out1, out2)
 
-    model = CharRNN(
-        vocab_size=n_letters,
-        hidden_size=128,
-        output_size=len(dataset.labels_uniq)
-    ).to(device)
 
-    print(model)
+inp1 = torch.randn(5, 5)
+inp2 = torch.randn(5, 5)
 
-    start = time.time()
-    losses = train_model(model, train_loader, epochs=20)
-    end = time.time()
+traced_f1 = torch.jit.trace(f1, (inp1, inp2))
+print("traced 1, 1:", test_fns(f1, traced_f1, (inp1, inp2)))
+print("traced 1, 2:", test_fns(f1, traced_f1, (-inp1, inp2)))
 
-    print(f"Training time: {end - start:.2f}s")
+compile_f1 = torch.compile(f1)
+print("compile 1, 1:", test_fns(f1, compile_f1, (inp1, inp2)))
+print("compile 1, 2:", test_fns(f1, compile_f1, (-inp1, inp2)))
+print("~" * 10)
 
-    plt.plot(losses)
-    plt.title("Training Loss")
-    plt.show()
 
-    evaluate(model, test_loader, dataset.labels_uniq)
+
+torch._logging.set_logs(graph_code=True)
+
+
+def f2(x, y):
+    return x + y
+
+
+inp1 = torch.randn(5, 5)
+inp2 = 3
+
+script_f2 = torch.jit.script(f2)
+try:
+    script_f2(inp1, inp2)
+except:
+    tb.print_exc()
+
+compile_f2 = torch.compile(f2)
+print("compile 2:", test_fns(f2, compile_f2, (inp1, inp2)))
+print("~" * 10)
+
+## Graph Breaks
+
+def bar(a, b):
+    x = a / (torch.abs(a) + 1)
+    if b.sum() < 0:
+        b = b * -1
+    return x * b
+
+
+opt_bar = torch.compile(bar)
+inp1 = torch.ones(10)
+inp2 = torch.ones(10)
+opt_bar(inp1, inp2)
+opt_bar(inp1, -inp2)
+
+# Reset to clear the torch.compile cache
+torch._dynamo.reset()
+opt_bar(inp1, inp2)
+opt_bar(inp1, -inp2)
+
+# Reset to clear the torch.compile cache
+torch._dynamo.reset()
+
+opt_bar_fullgraph = torch.compile(bar, fullgraph=True)
+try:
+    opt_bar_fullgraph(torch.randn(10), torch.randn(10))
+except:
+    tb.print_exc()
+
+from functorch.experimental.control_flow import cond
+
+
+@torch.compile(fullgraph=True)
+def bar_fixed(a, b):
+    x = a / (torch.abs(a) + 1)
+
+    def true_branch(y):
+        return y * -1
+
+    def false_branch(y):
+        # NOTE: torch.cond doesn't allow aliased outputs
+        return y.clone()
+
+    b = cond(b.sum() < 0, true_branch, false_branch, (b,))
+    return x * b
+
+
+bar_fixed(inp1, inp2)
+bar_fixed(inp1, -inp2)
